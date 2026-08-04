@@ -67,12 +67,10 @@ void errnum(long v)
 }
 
 /*
- * The player sockets are non-blocking so that reads never stall the server
- * (see the poll loop in main), which means a write can come back EAGAIN the
- * moment the peer's receive window fills - and with a 1800 byte window that
- * happens on the second chunk of every level stream.  EAGAIN is not an
- * error here, it is "ask again": retrying restores exactly the behaviour a
- * blocking write had, where the kernel did this waiting for us.
+ * Writes always happen with the socket blocking (see set_nonblock), so EAGAIN
+ * should not arise - but it is treated as "ask again" rather than as an error
+ * anyway, so that a write racing a read's brief non-blocking window cannot
+ * drop a packet on the floor.
  */
 int write_all(int fd, const unsigned char *buf, int len)
 {
@@ -141,17 +139,20 @@ static int pid_of(struct player *p)
 }
 
 /*
- * A socket is left non-blocking only for as long as it takes the client to
- * identify itself, and is put back to blocking the moment it has.
+ * Player sockets are flipped non-blocking around every read and put straight
+ * back to blocking, because the two directions need opposite things and one
+ * flag cannot serve both.
  *
- * Both halves of that matter.  Non-blocking is needed at the start because
- * ELKS counts readable data per socket and does not count anything that
- * arrived before accept() finished, so a client that sends its login in the
- * same breath as the connection is never reported readable and would sit
- * there until the join timeout: the handshake has to be polled, not waited
- * for.  Blocking has to come back before the level stream, because a
- * non-blocking socket never completes a large write here at all - the
- * kernel's write path retries internally and simply never succeeds.
+ * Reads must not block: select() cannot be trusted here.  ELKS answers it
+ * from a per-socket counter that does not count anything which arrived before
+ * accept() finished, and in practice never flags a joined player at all, so
+ * every player has to be polled every turn - which on a blocking socket would
+ * stall the whole server on the first one with nothing to say.
+ *
+ * Writes must block: a large write on a non-blocking socket never completes
+ * here.  The kernel's write path retries internally and simply never
+ * succeeds, so the level stream stops dead with the process asleep in
+ * write() at no CPU.
  */
 static int set_nonblock(int fd, int on)
 {
@@ -345,9 +346,6 @@ static void player_identify(struct player *p, const unsigned char *pkt)
     unsigned char out[131];
     int len = 131;
 
-    /* handshake done: back to blocking before anything large is written */
-    set_nonblock(p->fd, 0);
-
     p->proto = pkt[1];
     mcstr_get(p->name, pkt + 2);
     if (p->name[0] == '\0')
@@ -523,7 +521,16 @@ static void player_read(struct player *p)
 {
     int n, need;
 
+    /*
+     * Reads are always non-blocking, writes always blocking.  Both halves
+     * matter and they cannot be satisfied by one socket flag, so the flag is
+     * flipped around the read and put straight back: polling a blocking
+     * socket would stall the server on the first player with nothing to say,
+     * and a large write on a non-blocking socket never completes here at all.
+     */
+    set_nonblock(p->fd, 1);
     n = read(p->fd, p->in + p->inlen, (int)sizeof(p->in) - p->inlen);
+    set_nonblock(p->fd, 0);
     if (n <= 0) {
         if (n < 0 && (errno == EINTR || errno == EAGAIN))
             return;
@@ -855,18 +862,25 @@ int main(int argc, char **argv)
         now = (unsigned long)time((time_t *)0);
 
         /*
-         * Players still shaking hands are polled rather than waited on: what
-         * they sent before accept() completed is not counted as readable by
-         * ELKS and select() would never flag it (see set_nonblock).  Their
-         * sockets are non-blocking, so this costs one EAGAIN per idle
-         * connection.  Everyone else is read only when select() says so, on
-         * a blocking socket, which is what the level streamer needs.
+         * Players shaking hands and players in the world are polled every
+         * turn, whatever select() said.  ELKS cannot be relied on to report a
+         * socket readable: it answers from a per-socket counter that misses
+         * anything which arrived before accept() finished, and in practice
+         * never flagged a joined player at all - so waiting on select() meant
+         * chat, block edits and movement were read from nobody once they were
+         * in the world.
+         *
+         * The two mid-join states are deliberately left on select().  Polling
+         * flips O_NONBLOCK around each read, and doing that to the socket the
+         * level streamer is writing to - thousands of times a second while
+         * the loop spins on a busy turn - stalled the transfer outright.
+         * They have nothing to say until they are in the world anyway.
          */
         for (i = 0; i < MAX_PLAYERS; i++) {
             p = &players[i];
-            if (p->state == PS_FREE)
-                continue;
-            if (p->state == PS_HELLO || (ret > 0 && FD_ISSET(p->fd, &rfds)))
+            if (p->state == PS_HELLO || p->state == PS_PLAY)
+                player_read(p);                 /* polled: see set_nonblock */
+            else if (p->state != PS_FREE && ret > 0 && FD_ISSET(p->fd, &rfds))
                 player_read(p);
         }
 
@@ -936,11 +950,6 @@ int main(int argc, char **argv)
                     break;
             if (i == MAX_PLAYERS) {
                 send_kick(conn, "Server is full");
-                close(conn);
-                continue;
-            }
-            /* polled until identified, then blocking again */
-            if (set_nonblock(conn, 1) < 0) {
                 close(conn);
                 continue;
             }

@@ -161,13 +161,21 @@ were found the hard way and are worked around in the code.
   never is — so `select()` returns immediately every pass and a following
   blocking `accept()` parks the whole process until the *next* connection. The
   listening socket here is non-blocking and polled.
-- **Data that arrives before `accept()` completes is never reported readable.**
-  A client that sends its login in the same breath as the connection is
-  invisible to `select()` for ever. Sockets are therefore polled while a player
-  is still shaking hands.
+- **`select()` cannot be trusted to report a socket readable at all.** It
+  answers from a per-socket counter that does not count anything which arrived
+  before `accept()` finished — so a client sending its login in the same breath
+  as the connection is invisible for ever — and in practice it never flagged a
+  player already in the world either. Waiting on it meant chat, block edits and
+  movement were read from nobody once a player had joined, while the join
+  itself worked perfectly, which is a nasty way for it to fail: everything
+  server-to-client looks fine. Players are polled every turn instead.
 - **`O_NONBLOCK` breaks large writes.** A multi-KB write on a non-blocking
   socket never completes — the process sleeps inside `write()` and the transfer
-  simply stops. The socket goes back to blocking before the level stream.
+  simply stops. Reads therefore flip the flag on and straight back off around
+  each `read()`, so writes always happen on a blocking socket. Sockets being
+  streamed to are left out of the poll entirely: toggling the flag thousands of
+  times a second on the connection the level streamer is writing to stalled the
+  transfer outright.
 - **Writes can block indefinitely and cannot be interrupted.** `inet_write()`
   retries forever with no signal check, so a peer that vanishes mid-write can
   wedge the process. There is no userland fix; all this code can do is bound how
