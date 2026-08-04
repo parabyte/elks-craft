@@ -1,0 +1,5 @@
+*.o
+elkscraft
+*.img
+world.dat
+world.dat.new
