@@ -182,7 +182,10 @@ int  world_init(unsigned int seed, const char *path);
 const char *world_mode(void);
 unsigned char world_block(int x, int y, int z);
 int  world_setblock(int x, int y, int z, unsigned char blk);
-void world_spawn(int *x, int *y, int *z);
+void world_spawn(int *x, int *y, int *z, unsigned char *yaw, unsigned char *pitch);
+void world_setspawn(int x, int y, int z, unsigned char yaw, unsigned char pitch);
+int  world_spawn_isset(void);
+int  world_persists(void);          /* does anything written here survive? */
 void world_row(int y, int z, unsigned char *row);
 long world_volume(void);
 int  world_edit_capacity(void);     /* -1 when edits are unbounded */

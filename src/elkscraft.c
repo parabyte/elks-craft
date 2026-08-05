@@ -393,9 +393,7 @@ static void player_spawn_in(struct player *p)
     /* anything that changed behind the streamer's back, before they look */
     editlog_replay(p);
 
-    world_spawn(&p->x, &p->y, &p->z);
-    p->yaw = 0;
-    p->pitch = 0;
+    world_spawn(&p->x, &p->y, &p->z, &p->yaw, &p->pitch);
     p->state = PS_PLAY;
 
     /* our own entity, then everyone else's, then us to everyone else */
@@ -486,6 +484,94 @@ static void do_position(struct player *p, const unsigned char *pkt)
     }
 }
 
+/*
+ * Chat commands.  Returns non-zero if the line was one, so it is not also
+ * said out loud.
+ *
+ * Only spawn is settable.  The fallback drops people on top of the middle of
+ * the map, which is what you want on open terrain and exactly wrong once
+ * somebody builds there - the roof is not where a visitor should arrive.
+ * There is no operator model on a machine this size, so anyone in the world
+ * can move it, and everyone is told who did.
+ */
+/* case insensitive compare, so /SetSpawn works as well as /setspawn */
+static int sameword(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        int ca = *a, cb = *b;
+
+        if (ca >= 'A' && ca <= 'Z')
+            ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z')
+            cb += 'a' - 'A';
+        if (ca != cb)
+            return 0;
+    }
+    return *a == *b;
+}
+
+static int do_command(struct player *p, const char *text)
+{
+    char line[MC_STRLEN + 1];
+    const char *s;
+
+    if (text[0] != '/')
+        return 0;
+
+    /*
+     * A line with a space in it is chat, even though it opens with a slash.
+     * ClassiCube splits anything over 64 characters into separate Message
+     * packets with nothing to mark the second as a continuation, so a long
+     * enough sentence can hand us a fragment that merely happens to start
+     * with one.  Every command here is a single word, so requiring that is
+     * enough to tell them apart - and getting it wrong the other way would
+     * silently eat half of what somebody said.
+     */
+    for (s = text; *s; s++)
+        if (*s == ' ')
+            return 0;
+
+    if (sameword(text, "/setspawn")) {
+        world_setspawn(p->x, p->y, p->z, p->yaw, p->pitch);
+        line[0] = '\0';
+        catn(line, p->name, sizeof(line));
+        catn(line, " set the spawn point", sizeof(line));
+        broadcast_message(line, (struct player *)0);
+        if (!world_persists())
+            send_message(p->fd, "&cNo world file (-d): spawn is lost on restart");
+        return 1;
+    }
+    if (sameword(text, "/help")) {
+        send_message(p->fd, "&e/setspawn - put the spawn point where you stand");
+        send_message(p->fd, "&eAnything else is chat, and everyone sees it");
+        return 1;
+    }
+    send_message(p->fd, "&cUnknown command.  Try /help");
+    return 1;
+}
+
+/*
+ * Put back the colour codes the client took out.
+ *
+ * ClassiCube rewrites every '&' a player types to '%' before it goes on the
+ * wire, so codes cannot arrive intact and a server that relays the text as it
+ * stands shows a literal "%c" where the player meant a colour.  Translating
+ * the pair back is what Classic servers conventionally do, and without it
+ * players cannot colour their own chat at all.  Only '%' followed by a valid
+ * colour digit is touched, so a percentage sign is left alone.
+ */
+static void recolour(char *s)
+{
+    for (; *s; s++) {
+        int c = s[1];
+
+        if (c >= 'A' && c <= 'F')
+            c += 'a' - 'A';
+        if (*s == '%' && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            *s = '&';
+    }
+}
+
 static void do_message(struct player *p, const unsigned char *pkt)
 {
     unsigned char out[66];
@@ -493,6 +579,9 @@ static void do_message(struct player *p, const unsigned char *pkt)
     char line[MC_STRLEN + 1];
 
     mcstr_get(text, pkt + 2);
+    if (do_command(p, text))
+        return;
+    recolour(text);
 
     line[0] = '\0';
     catn(line, p->name, sizeof(line));
@@ -500,7 +589,15 @@ static void do_message(struct player *p, const unsigned char *pkt)
     catn(line, text, sizeof(line));
 
     out[0] = S_MESSAGE;
-    out[1] = (unsigned char)pid_of(p);
+    /*
+     * Vanilla clients ignore this byte for anything but 0xff, which means
+     * "server message, colour it yellow".  Under the CPE MessageTypes
+     * extension the same byte selects a HUD slot instead, so sending a
+     * player's slot index here would route three players out of four into
+     * status lines the moment that extension was ever negotiated.  Zero is
+     * ordinary chat under both readings.
+     */
+    out[1] = 0;
     mcstr(out + 2, line);
     broadcast(out, sizeof(out), (struct player *)0);
 }
@@ -788,7 +885,9 @@ int main(int argc, char **argv)
         errmsg(worldfile);
     } else
         errmsg(", not saved (no -d)");
-    errmsg("\nelkscraft: ready\n");
+    errmsg(world_spawn_isset() ? "\nelkscraft: spawn point loaded\n"
+                              : "\nelkscraft: no spawn set, using the map centre\n");
+    errmsg("elkscraft: ready\n");
 
     /*
      * Point stderr at /dev/null but close stdin and stdout outright: a

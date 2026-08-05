@@ -106,6 +106,21 @@ elkscraft -w 96 -h 32 -l 96 -s 7 -n "my server"
 | `-m <motd>` | message of the day | `The ELKS Minecraft Server` |
 | `-d <file>` | world file to load at start and save to | none |
 
+### Commands
+
+| command | what it does |
+| --- | --- |
+| `/setspawn` | move the spawn point to where you are standing, facing the way you are looking |
+
+Without one set, players arrive on top of the highest block in the middle of
+the map. That is right for open terrain and wrong the moment anybody builds
+there, since the roof is not where a visitor should turn up. `/setspawn` is
+stored in the world file header and survives a restart, so it needs `-d`;
+without it the server says so and the spawn reverts on the next start.
+
+There is no operator model on a machine this size, so anyone in the world can
+move the spawn, and everyone is told who did.
+
 ### Persistence
 
 **Builds are only saved if you pass `-d`.** Without it the world lives in far
@@ -115,6 +130,11 @@ With `-d`, edits mark the world dirty and it is written back in 1K slices from
 the idle path, at most once a minute, plus a full write on shutdown. The save
 goes to `<file>.new` and is renamed over the real file only once complete, so an
 interrupted save cannot destroy the previous world.
+
+The file starts with a short header — magic, dimensions, and the spawn point —
+followed by the raw block array. Worlds written before `/setspawn` existed carry
+the older `DCW1` magic and no spawn field; they still load, and simply have no
+spawn set until one is placed.
 
 Persistence needs the far-memory block array. If `fmemalloc()` cannot get it,
 the server falls back to generating terrain on demand with a bounded table of
@@ -194,6 +214,24 @@ were found the hard way and are worked around in the code.
   machine off the network. If you want it publicly reachable, put something in
   front that caps concurrent connections to a couple and drops idle ones, so
   the 8086 only ever sees a trickle.
+- **`rename()` cannot replace an existing file, and failing to allow for that
+  cost every edit anyone ever made.** ELKS implements `rename()` as `link()`
+  followed by `unlink()` (`fs/namei.c`), and `minix_link()` refuses a name that
+  already exists with `EEXIST` — where POSIX would replace it. So the finished
+  save could be renamed over the world file exactly once, when there was no
+  world file yet, and never again. Because the dirty flag is deliberately left
+  set when a save does not complete, the result was not one lost save but a
+  server that rewrote the entire world to an MFM drive every sixty seconds for
+  ever, persisted nothing, and eventually ground the machine to a halt. The
+  destination is now unlinked first, which is what `mv`, `decomp` and every
+  other program in the ELKS tree that renames over a file already does.
+
+  The save is no longer atomic as a result, so the loader falls back to the
+  `.new` file: at every instant at least one of the two names holds a complete
+  world. And since what matters is that the world reached the disk rather than
+  which name it landed under, the save counts as done even if the rename itself
+  fails — otherwise a filesystem that cannot link at all, like FAT, would bring
+  the sixty-second retry loop straight back.
 - **`ia16-elf-gcc` 6.3 at `-Os` miscompiles some 32-bit values.** In
   `level_finish()` a `unsigned long` local was allocated a stack slot that was
   never written, and the gzip trailer went out as uninitialised stack — every

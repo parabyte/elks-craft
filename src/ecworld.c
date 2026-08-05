@@ -20,7 +20,8 @@
  * the disk.
  */
 
-#include <stdio.h>          /* rename(), for the atomic world save */
+#include <stdio.h>          /* rename(), for publishing a finished save */
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
@@ -32,8 +33,21 @@
 #define MK_FP(seg, off) ((void __far *)((((unsigned long)(seg)) << 16) | \
                                         ((unsigned int)(off))))
 
+/*
+ * World file header.  "DCW1" is dimensions only; "DCW2" carries a spawn
+ * point after them.  Both are still read, so a world saved by an older
+ * build loads here and simply has no spawn set until one is placed.
+ *
+ *      0..3    magic
+ *      4..9    width, height, length, each 16 bit little endian
+ *     10..15   spawn x, y, z, fixed point 1/32 block, x < 0 = unset
+ *     16       yaw
+ *     17       pitch
+ */
 #define SAVE_MAGIC      "DCW1"
+#define SAVE_MAGIC2     "DCW2"
 #define SAVE_HDRLEN     10
+#define SAVE_HDRLEN2    18
 /*
  * Bytes written per idle tick.  This buffer is static rather than automatic
  * on purpose: the program links with -maout-stack=3072, so a 4K array on the
@@ -59,6 +73,15 @@ static const char *save_path;
 static int save_fd = -1;
 static long save_idx;
 static int world_dirty;
+
+/*
+ * Spawn point, in the same fixed point the client sends positions in, so
+ * whatever /setspawn was typed standing on is reproduced exactly - including
+ * the 51/32 model offset, which is already in the figure the client gave us.
+ * Negative x means none has been set and the terrain scan is used instead.
+ */
+static int spawn_x = -1, spawn_y, spawn_z;
+static unsigned char spawn_yaw, spawn_pitch;
 
 /* ------------------------------------------------------------ addressing */
 
@@ -336,11 +359,49 @@ void world_row(int y, int z, unsigned char *row)
     }
 }
 
-void world_spawn(int *x, int *y, int *z)
+void world_setspawn(int x, int y, int z, unsigned char yaw, unsigned char pitch)
+{
+    spawn_x = x;
+    spawn_y = y;
+    spawn_z = z;
+    spawn_yaw = yaw;
+    spawn_pitch = pitch;
+    world_dirty = 1;            /* it lives in the header, so rewrite the file */
+}
+
+int world_spawn_isset(void)
+{
+    return spawn_x >= 0;
+}
+
+/* whether anything written to the world outlives the process */
+int world_persists(void)
+{
+    return save_path != (const char *)0 && wseg != 0;
+}
+
+void world_spawn(int *x, int *y, int *z, unsigned char *yaw, unsigned char *pitch)
 {
     int bx = world_w / 2, bz = world_l / 2;
     int h;
 
+    *yaw = 0;
+    *pitch = 0;
+
+    if (spawn_x >= 0) {         /* placed with /setspawn */
+        *x = spawn_x;
+        *y = spawn_y;
+        *z = spawn_z;
+        *yaw = spawn_yaw;
+        *pitch = spawn_pitch;
+        return;
+    }
+
+    /*
+     * Nothing set, so fall back to the middle of the map.  This puts people
+     * on top of whatever stands there rather than inside it, which is right
+     * for open terrain and is why /setspawn exists for anywhere it is not.
+     */
     if (wseg) {
         /* scan down the real column so we land on top of whatever is there */
         for (h = world_h - 1; h > 0; h--)
@@ -373,17 +434,34 @@ void world_spawn(int *x, int *y, int *z)
 static int world_load(const char *path)
 {
     unsigned char buf[512];
-    unsigned char hdr[SAVE_HDRLEN];
+    unsigned char hdr[SAVE_HDRLEN2];
     unsigned char __far *dst;
     long left, idx = 0;
-    int fd, n, i;
+    int fd, n, i, sx;
 
     fd = open(path, O_RDONLY);
     if (fd < 0)
         return 0;
 
-    if (read(fd, hdr, SAVE_HDRLEN) != SAVE_HDRLEN ||
-        memcmp(hdr, SAVE_MAGIC, 4) != 0) {
+    if (read(fd, hdr, SAVE_HDRLEN) != SAVE_HDRLEN) {
+        close(fd);
+        return 0;
+    }
+    if (memcmp(hdr, SAVE_MAGIC2, 4) == 0) {
+        if (read(fd, hdr + SAVE_HDRLEN, SAVE_HDRLEN2 - SAVE_HDRLEN)
+                != SAVE_HDRLEN2 - SAVE_HDRLEN) {
+            close(fd);
+            return 0;
+        }
+        sx = (int)(short)(hdr[10] | (hdr[11] << 8));
+        if (sx >= 0) {
+            spawn_x = sx;
+            spawn_y = (int)(short)(hdr[12] | (hdr[13] << 8));
+            spawn_z = (int)(short)(hdr[14] | (hdr[15] << 8));
+            spawn_yaw = hdr[16];
+            spawn_pitch = hdr[17];
+        }
+    } else if (memcmp(hdr, SAVE_MAGIC, 4) != 0) {
         close(fd);
         return 0;
     }
@@ -439,9 +517,24 @@ static void save_tmp_path(char *out, int size)
     out[n] = '\0';
 }
 
+/*
+ * Load the world from under the temporary name.  Only reached when the real
+ * file is missing or unreadable, which on this kernel means the process died
+ * between the unlink and the link that stand in for a rename.
+ */
+static int world_load_tmp(void)
+{
+    char tmp[64];
+
+    if (!save_path)
+        return 0;
+    save_tmp_path(tmp, (int)sizeof(tmp));
+    return world_load(tmp);
+}
+
 void world_save_begin(void)
 {
-    unsigned char hdr[SAVE_HDRLEN];
+    unsigned char hdr[SAVE_HDRLEN2];
     char tmp[64];
 
     if (!save_path || !wseg || !world_dirty || save_fd >= 0)
@@ -452,14 +545,22 @@ void world_save_begin(void)
     if (save_fd < 0)
         return;
 
-    memcpy(hdr, SAVE_MAGIC, 4);
+    memcpy(hdr, SAVE_MAGIC2, 4);
     hdr[4] = (unsigned char)world_w;
     hdr[5] = (unsigned char)(world_w >> 8);
     hdr[6] = (unsigned char)world_h;
     hdr[7] = (unsigned char)(world_h >> 8);
     hdr[8] = (unsigned char)world_l;
     hdr[9] = (unsigned char)(world_l >> 8);
-    if (write(save_fd, hdr, SAVE_HDRLEN) != SAVE_HDRLEN) {
+    hdr[10] = (unsigned char)spawn_x;
+    hdr[11] = (unsigned char)(spawn_x >> 8);
+    hdr[12] = (unsigned char)spawn_y;
+    hdr[13] = (unsigned char)(spawn_y >> 8);
+    hdr[14] = (unsigned char)spawn_z;
+    hdr[15] = (unsigned char)(spawn_z >> 8);
+    hdr[16] = spawn_yaw;
+    hdr[17] = spawn_pitch;
+    if (write(save_fd, hdr, SAVE_HDRLEN2) != SAVE_HDRLEN2) {
         close(save_fd);
         save_fd = -1;
         return;
@@ -490,11 +591,34 @@ int world_save_pump(void)
     left = world_volume() - save_idx;
     if (left <= 0) {
         char tmp[64];
+        int saved;
 
         close(save_fd);
         save_fd = -1;
         save_tmp_path(tmp, (int)sizeof(tmp));
-        if (rename(tmp, save_path) == 0)
+        /*
+         * ELKS rename() is not POSIX rename().  The kernel implements it as
+         * link() followed by unlink() (fs/namei.c), and minix_link() refuses
+         * a name that already exists with EEXIST - where POSIX would replace
+         * it.  So renaming the finished save over the previous world failed
+         * every time after the very first one, when there was nothing there
+         * to replace.  world_dirty is deliberately left set when a save does
+         * not complete, so the effect was not one lost save: it was a server
+         * that rewrote the whole world to an MFM drive every sixty seconds
+         * for ever, persisted nothing, and eventually wedged the machine.
+         *
+         * Unlinking the destination first is what lets the link succeed.
+         *
+         * What matters after that is whether the world is on the disk, not
+         * which name it is under.  If the destination is gone and the rename
+         * still fails - on a FAT filesystem it always will, since msdos has
+         * no link operation at all - the finished world is sitting under the
+         * temporary name and world_load_tmp() will find it next time.  Either
+         * way the data is safe and the save must be marked done, or the
+         * retry loop that caused all this simply comes back.
+         */
+        saved = (unlink(save_path) == 0 || errno == ENOENT);
+        if (rename(tmp, save_path) == 0 || saved)
             world_dirty = 0;    /* edits from here on mark it dirty again */
         return 0;
     }
@@ -548,7 +672,12 @@ int world_init(unsigned int seed, const char *path)
                 for (x = 0; x < world_w; x++)
                     hmap[z * world_w + x] = (unsigned char)height_at(x, z);
         }
-        if (!path || !world_load(path))
+        /*
+         * The .new file is tried second because a save unlinks the real name
+         * before renaming over it, so a crash in that gap leaves the finished
+         * world under the temporary name and nothing under the real one.
+         */
+        if (!path || (!world_load(path) && !world_load_tmp()))
             world_generate();
         /* the block array is the world now; the heightmap was scaffolding */
         free(hmap);
