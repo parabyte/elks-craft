@@ -25,6 +25,17 @@
 #include <sys/select.h>
 #include "elkscraft.h"
 
+/*
+ * Receive ring for the listening socket.  Nothing is ever accepted into it,
+ * so it wants to be small: every byte is memory ktcp cannot spend on a real
+ * connection.  Newer trees split the old single constant into a set named by
+ * what the protocol carries; fall back to the original name so this still
+ * builds against a stock ELKS.
+ */
+#ifndef SO_ACCEPT_BUFSIZ_TINY
+#define SO_ACCEPT_BUFSIZ_TINY   SO_LISTEN_BUFSIZ
+#endif
+
 struct player players[MAX_PLAYERS];
 int world_w = DEF_WIDTH, world_h = DEF_HEIGHT, world_l = DEF_LENGTH;
 
@@ -120,6 +131,22 @@ static void catn(char *dst, const char *src, int size)
     while (i < size - 1 && *src)
         dst[i++] = *src++;
     dst[i] = '\0';
+}
+
+/* case insensitive compare, so /SetSpawn works as well as /setspawn */
+static int sameword(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        int ca = *a, cb = *b;
+
+        if (ca >= 'A' && ca <= 'Z')
+            ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z')
+            cb += 'a' - 'A';
+        if (ca != cb)
+            return 0;
+    }
+    return *a == *b;
 }
 
 static int rd16(const unsigned char *p)
@@ -494,22 +521,6 @@ static void do_position(struct player *p, const unsigned char *pkt)
  * There is no operator model on a machine this size, so anyone in the world
  * can move it, and everyone is told who did.
  */
-/* case insensitive compare, so /SetSpawn works as well as /setspawn */
-static int sameword(const char *a, const char *b)
-{
-    for (; *a && *b; a++, b++) {
-        int ca = *a, cb = *b;
-
-        if (ca >= 'A' && ca <= 'Z')
-            ca += 'a' - 'A';
-        if (cb >= 'A' && cb <= 'Z')
-            cb += 'a' - 'A';
-        if (ca != cb)
-            return 0;
-    }
-    return *a == *b;
-}
-
 static int do_command(struct player *p, const char *text)
 {
     char line[MC_STRLEN + 1];
@@ -563,11 +574,14 @@ static int do_command(struct player *p, const char *text)
 static void recolour(char *s)
 {
     for (; *s; s++) {
-        int c = s[1];
+        int c;
 
+        if (*s != '%')
+            continue;
+        c = s[1];
         if (c >= 'A' && c <= 'F')
             c += 'a' - 'A';
-        if (*s == '%' && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))
             *s = '&';
     }
 }
@@ -805,7 +819,7 @@ int main(int argc, char **argv)
     ret = 1;
     if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &ret, sizeof(int)) < 0)
         errmsg("elkscraft: SO_REUSEADDR\n");
-    ret = SO_LISTEN_BUFSIZ;
+    ret = SO_ACCEPT_BUFSIZ_TINY;
     if (setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &ret, sizeof(int)) < 0)
         errmsg("elkscraft: SO_RCVBUF\n");
 

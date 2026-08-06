@@ -374,12 +374,6 @@ int world_spawn_isset(void)
     return spawn_x >= 0;
 }
 
-/* whether anything written to the world outlives the process */
-int world_persists(void)
-{
-    return save_path != (const char *)0 && wseg != 0;
-}
-
 void world_spawn(int *x, int *y, int *z, unsigned char *yaw, unsigned char *pitch)
 {
     int bx = world_w / 2, bz = world_l / 2;
@@ -644,6 +638,12 @@ int world_needs_save(void)
 int world_saving(void)
 {
     return save_fd >= 0;
+}
+
+/* whether anything written to the world outlives the process */
+int world_persists(void)
+{
+    return save_path != (const char *)0 && wseg != 0;
 }
 
 /* ---------------------------------------------------------------- setup */
