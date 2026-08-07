@@ -2,6 +2,8 @@
 
 **The ELKS Minecraft server.**
 
+Map designed by Void of irc
+
 A Minecraft Classic 0.30 server that runs on [ELKS](https://github.com/ghaerr/elks),
 the 16-bit Unix for 8086-class machines. It serves protocol 7 — what the
 [ClassiCube](https://www.classicube.net/) client speaks — so you can point a
